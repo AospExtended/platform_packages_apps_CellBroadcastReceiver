@@ -17,7 +17,6 @@
 package com.android.cellbroadcastreceiver;
 
 import android.app.ActivityManagerNative;
-import android.app.KeyguardManager;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -25,6 +24,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.os.Binder;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.RemoteException;
@@ -37,10 +37,13 @@ import android.telephony.SmsCbCmasInfo;
 import android.telephony.SmsCbEtwsInfo;
 import android.telephony.SmsCbLocation;
 import android.telephony.SmsCbMessage;
+import android.telephony.SubscriptionManager;
 import android.util.Log;
 
 import com.android.cellbroadcastreceiver.CellBroadcastAlertAudio.ToneType;
 import com.android.cellbroadcastreceiver.CellBroadcastOtherChannelsManager.CellBroadcastChannelRange;
+import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.telephony.PhoneConstants;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -167,6 +170,12 @@ public class CellBroadcastAlertService extends Service {
         }
 
         final CellBroadcastMessage cbm = new CellBroadcastMessage(message);
+        int subId = intent.getExtras().getInt(PhoneConstants.SUBSCRIPTION_KEY);
+        if (SubscriptionManager.isValidSubscriptionId(subId)) {
+            cbm.setSubId(subId);
+        } else {
+            Log.e(TAG, "Invalid subscription id");
+        }
 
         if (!isMessageEnabledByUser(cbm)) {
             Log.d(TAG, "ignoring alert of type " + cbm.getServiceCategory() +
@@ -259,7 +268,7 @@ public class CellBroadcastAlertService extends Service {
             return;
         }
 
-        if (cbm.isEmergencyAlertMessage()) {
+        if (isEmergencyMessage(this, cbm)) {
             // start alert sound / vibration / TTS and display full-screen alert
             openEmergencyAlertNotification(cbm);
         } else {
@@ -450,18 +459,11 @@ public class CellBroadcastAlertService extends Service {
         }
         startService(audioIntent);
 
-        // Decide which activity to start based on the state of the keyguard.
-        Class c = CellBroadcastAlertDialog.class;
-        KeyguardManager km = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
-        if (km.inKeyguardRestrictedInputMode()) {
-            // Use the full screen activity for security.
-            c = CellBroadcastAlertFullScreen.class;
-        }
-
         ArrayList<CellBroadcastMessage> messageList = new ArrayList<CellBroadcastMessage>(1);
         messageList.add(message);
 
-        Intent alertDialogIntent = createDisplayMessageIntent(this, c, messageList);
+        Intent alertDialogIntent = createDisplayMessageIntent(this, CellBroadcastAlertDialog.class,
+                messageList);
         alertDialogIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(alertDialogIntent);
     }
@@ -474,16 +476,16 @@ public class CellBroadcastAlertService extends Service {
     static void addToNotificationBar(CellBroadcastMessage message,
                                      ArrayList<CellBroadcastMessage> messageList, Context context,
                                      boolean fromSaveState) {
-        int channelTitleId = CellBroadcastResources.getDialogTitleResource(message);
+        int channelTitleId = CellBroadcastResources.getDialogTitleResource(context, message);
         CharSequence channelName = context.getText(channelTitleId);
         String messageBody = message.getMessageBody();
 
         // Create intent to show the new messages when user selects the notification.
         Intent intent = createDisplayMessageIntent(context, CellBroadcastAlertDialog.class,
                 messageList);
-        intent.putExtra(CellBroadcastAlertFullScreen.FROM_NOTIFICATION_EXTRA, true);
-        intent.putExtra(CellBroadcastAlertFullScreen.FROM_SAVE_STATE_NOTIFICATION_EXTRA,
-                fromSaveState);
+
+        intent.putExtra(CellBroadcastAlertDialog.FROM_NOTIFICATION_EXTRA, true);
+        intent.putExtra(CellBroadcastAlertDialog.FROM_SAVE_STATE_NOTIFICATION_EXTRA, fromSaveState);
 
         PendingIntent pi = PendingIntent.getActivity(context, NOTIFICATION_ID, intent,
                 PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_UPDATE_CURRENT);
@@ -525,8 +527,53 @@ public class CellBroadcastAlertService extends Service {
         return intent;
     }
 
+    @VisibleForTesting
     @Override
     public IBinder onBind(Intent intent) {
-        return null;    // clients can't bind to this service
+        return new LocalBinder();
+    }
+
+    @VisibleForTesting
+    class LocalBinder extends Binder {
+        public CellBroadcastAlertService getService() {
+            return CellBroadcastAlertService.this;
+        }
+    }
+
+    /**
+     * Check if the cell broadcast message is an emergency message or not
+     * @param context Device context
+     * @param cbm Cell broadcast message
+     * @return True if the message is an emergency message, otherwise false.
+     */
+    public static boolean isEmergencyMessage(Context context, CellBroadcastMessage cbm) {
+        boolean isEmergency = false;
+
+        if (cbm == null) {
+            return false;
+        }
+
+        int id = cbm.getServiceCategory();
+        int subId = cbm.getSubId();
+
+        if (cbm.isEmergencyAlertMessage()) {
+            isEmergency = true;
+        } else {
+            ArrayList<CellBroadcastChannelRange> ranges = CellBroadcastOtherChannelsManager.
+                    getInstance().getCellBroadcastChannelRanges(context, subId);
+
+            if (ranges != null) {
+                for (CellBroadcastChannelRange range : ranges) {
+                    if (range.mStartId <= id && range.mEndId >= id) {
+                        isEmergency = range.mIsEmergency;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Log.d(TAG, "isEmergencyMessage: " + isEmergency + ", subId = " + subId + ", " +
+                "message id = " + id);
+        return isEmergency;
     }
 }
